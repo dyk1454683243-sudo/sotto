@@ -84,9 +84,16 @@ impl RaceTaskOwner {
         let mut failures = Vec::new();
         for cleanup in self.cleanups.drain(..) {
             let remaining = deadline.saturating_duration_since(Instant::now());
+            let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup)) {
+                Ok(future) => future,
+                Err(panic) => {
+                    failures.push(format!("cleanup panicked: {}", panic_message(panic)));
+                    continue;
+                }
+            };
             let result = timeout(
                 remaining,
-                std::panic::AssertUnwindSafe(cleanup()).catch_unwind(),
+                std::panic::AssertUnwindSafe(future).catch_unwind(),
             )
             .await;
             match result {
@@ -206,15 +213,18 @@ where
         owner.abort_and_join_within(teardown_budget).await
     };
     let registered_cleanup = owner.cleanup_registered_within(teardown_budget).await;
-    let explicit_cleanup = match timeout(
-        teardown_budget,
-        std::panic::AssertUnwindSafe(cleanup()).catch_unwind(),
-    )
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(panic)) => Err(format!("cleanup panicked: {}", panic_message(panic))),
-        Err(_) => Err("cleanup timed out".into()),
+    let explicit_cleanup = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(cleanup)) {
+        Ok(future) => match timeout(
+            teardown_budget,
+            std::panic::AssertUnwindSafe(future).catch_unwind(),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(panic)) => Err(format!("cleanup panicked: {}", panic_message(panic))),
+            Err(_) => Err("cleanup timed out".into()),
+        },
+        Err(panic) => Err(format!("cleanup panicked: {}", panic_message(panic))),
     };
     let cleanup_result = match (registered_cleanup, explicit_cleanup) {
         (Ok(()), Ok(())) => Ok(()),
@@ -436,6 +446,26 @@ mod tests {
         .await
         .expect("successful scenario cleanup");
         assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cleanup_invocation_panics_are_reported_and_teardown_continues() {
+        let mut owner = RaceTaskOwner::new();
+        owner.register_cleanup(|| {
+            panic!("registered cleanup invocation failure");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok::<(), String>(()))
+        });
+        let result = run_with_teardown(&mut owner, async { Ok::<(), String>(()) }, || {
+            panic!("explicit cleanup invocation failure");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok::<(), String>(()))
+        })
+        .await;
+        assert_eq!(
+            result,
+            Err("cleanup: cleanup panicked: registered cleanup invocation failure; cleanup panicked: explicit cleanup invocation failure".into())
+        );
     }
 
     #[tokio::test]
