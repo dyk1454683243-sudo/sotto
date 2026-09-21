@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{any::Any, future::Future};
 
 use futures_util::FutureExt;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -39,10 +39,14 @@ impl RaceTaskOwner {
     }
 
     pub async fn abort_and_join(&mut self) -> Result<(), String> {
+        self.abort_and_join_within(RACE_TIMEOUT).await
+    }
+
+    pub async fn abort_and_join_within(&mut self, budget: Duration) -> Result<(), String> {
         for handle in self.handles.iter().flatten() {
             handle.abort();
         }
-        self.settle_within(RACE_TIMEOUT, true).await
+        self.settle_within(budget, true).await
     }
 
     pub async fn join_all(&mut self) -> Result<(), String> {
@@ -126,20 +130,65 @@ where
     C: FnOnce() -> CF,
     CF: Future<Output = Result<(), String>>,
 {
-    let outcome = std::panic::AssertUnwindSafe(scenario).catch_unwind().await;
+    run_with_teardown_with_budgets(owner, scenario, cleanup, RACE_TIMEOUT, RACE_TIMEOUT).await
+}
+
+pub async fn run_with_teardown_with_budgets<T, F, C, CF>(
+    owner: &mut RaceTaskOwner,
+    scenario: F,
+    cleanup: C,
+    scenario_budget: Duration,
+    teardown_budget: Duration,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<(), String>>,
+{
+    let outcome = timeout(
+        scenario_budget,
+        std::panic::AssertUnwindSafe(scenario).catch_unwind(),
+    )
+    .await;
     let scenario_result = match outcome {
-        Ok(result) => result,
-        Err(_) => Err("scenario panicked".into()),
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => Err(format!("scenario panicked: {}", panic_message(panic))),
+        Err(_) => Err("scenario timed out".into()),
     };
     let task_result = if scenario_result.is_ok() {
-        owner.join_all().await
+        match owner.join_all_within(teardown_budget).await {
+            Ok(()) => Ok(()),
+            Err(error) => match owner.abort_and_join_within(teardown_budget).await {
+                Ok(()) => Err(error),
+                Err(abort_error) => Err(format!("{error}; {abort_error}")),
+            },
+        }
     } else {
-        owner.abort_and_join().await
+        owner.abort_and_join_within(teardown_budget).await
     };
-    let cleanup_result = cleanup().await;
+    let cleanup_result = match timeout(
+        teardown_budget,
+        std::panic::AssertUnwindSafe(cleanup()).catch_unwind(),
+    )
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => Err(format!("cleanup panicked: {}", panic_message(panic))),
+        Err(_) => Err("cleanup timed out".into()),
+    };
     match (scenario_result, task_result, cleanup_result) {
         (Ok(value), Ok(()), Ok(())) => Ok(value),
         (scenario, tasks, cleanup) => Err(format_failure(scenario, tasks, cleanup)),
+    }
+}
+
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
+    match panic.downcast::<String>() {
+        Ok(message) => *message,
+        Err(panic) => match panic.downcast::<&'static str>() {
+            Ok(message) => (*message).into(),
+            Err(_) => "non string panic payload".into(),
+        },
     }
 }
 
@@ -218,7 +267,7 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::time::Duration;
 
-    use super::{receive_owned, run_with_teardown, RaceTaskOwner};
+    use super::{receive_owned, run_with_teardown, run_with_teardown_with_budgets, RaceTaskOwner};
 
     struct DropMarker(Arc<AtomicBool>);
 
@@ -267,8 +316,63 @@ mod tests {
         .await;
         assert_eq!(
             result,
-            Err("scenario: scenario panicked; cleanup: intentional cleanup failure".into())
+            Err("scenario: scenario panicked: intentional scenario failure; cleanup: intentional cleanup failure".into())
         );
+    }
+
+    #[tokio::test]
+    async fn scenario_teardown_preserves_panic_payload() {
+        let mut owner = RaceTaskOwner::new();
+        let result = run_with_teardown(
+            &mut owner,
+            async {
+                panic!("readiness never arrived");
+                #[allow(unreachable_code)]
+                Ok::<(), String>(())
+            },
+            || async { Ok::<(), String>(()) },
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err("scenario: scenario panicked: readiness never arrived".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_bounds_scenario_and_cleanup_phases() {
+        let mut owner = RaceTaskOwner::new();
+        let timed_out_scenario = run_with_teardown_with_budgets(
+            &mut owner,
+            async {
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Ok::<(), String>(())
+            },
+            || async { Ok::<(), String>(()) },
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(
+            timed_out_scenario,
+            Err("scenario: scenario timed out".into())
+        );
+
+        let mut owner = RaceTaskOwner::new();
+        let timed_out_cleanup = run_with_teardown_with_budgets(
+            &mut owner,
+            async { Ok::<(), String>(()) },
+            || async {
+                std::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                Ok::<(), String>(())
+            },
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(timed_out_cleanup, Err("cleanup: cleanup timed out".into()));
     }
 
     #[tokio::test]
