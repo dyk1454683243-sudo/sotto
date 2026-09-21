@@ -1,4 +1,4 @@
-use std::{any::Any, future::Future};
+use std::{any::Any, future::Future, pin::Pin};
 
 use futures_util::FutureExt;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -16,13 +16,26 @@ pub struct OwnedTask<T> {
 
 pub struct RaceTaskOwner {
     handles: Vec<Option<JoinHandle<()>>>,
+    cleanups: Vec<CleanupCallback>,
 }
+
+type CleanupCallback = Box<dyn FnOnce() -> CleanupFuture + Send>;
+type CleanupFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
 impl RaceTaskOwner {
     pub fn new() -> Self {
         Self {
             handles: Vec::new(),
+            cleanups: Vec::new(),
         }
+    }
+
+    pub fn register_cleanup<F, Fut>(&mut self, cleanup: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.cleanups.push(Box::new(move || Box::pin(cleanup())));
     }
 
     pub fn spawn<T, F>(&mut self, future: F) -> OwnedTask<T>
@@ -64,6 +77,32 @@ impl RaceTaskOwner {
 
     pub async fn join_all_within(&mut self, budget: Duration) -> Result<(), String> {
         self.settle_within(budget, false).await
+    }
+
+    async fn cleanup_registered_within(&mut self, budget: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + budget;
+        let mut failures = Vec::new();
+        for cleanup in self.cleanups.drain(..) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let result = timeout(
+                remaining,
+                std::panic::AssertUnwindSafe(cleanup()).catch_unwind(),
+            )
+            .await;
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => failures.push(error),
+                Ok(Err(panic)) => {
+                    failures.push(format!("cleanup panicked: {}", panic_message(panic)))
+                }
+                Err(_) => failures.push("cleanup timed out".into()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     async fn settle_within(
@@ -166,7 +205,8 @@ where
     } else {
         owner.abort_and_join_within(teardown_budget).await
     };
-    let cleanup_result = match timeout(
+    let registered_cleanup = owner.cleanup_registered_within(teardown_budget).await;
+    let explicit_cleanup = match timeout(
         teardown_budget,
         std::panic::AssertUnwindSafe(cleanup()).catch_unwind(),
     )
@@ -175,6 +215,11 @@ where
         Ok(Ok(result)) => result,
         Ok(Err(panic)) => Err(format!("cleanup panicked: {}", panic_message(panic))),
         Err(_) => Err("cleanup timed out".into()),
+    };
+    let cleanup_result = match (registered_cleanup, explicit_cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(registered), Ok(())) | (Ok(()), Err(registered)) => Err(registered),
+        (Err(registered), Err(explicit)) => Err(format!("{registered}; {explicit}")),
     };
     match (scenario_result, task_result, cleanup_result) {
         (Ok(value), Ok(()), Ok(())) => Ok(value),
@@ -373,6 +418,24 @@ mod tests {
         )
         .await;
         assert_eq!(timed_out_cleanup, Err("cleanup: cleanup timed out".into()));
+    }
+
+    #[tokio::test]
+    async fn registered_cleanup_runs_after_a_successful_scenario() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let mut owner = RaceTaskOwner::new();
+        let cleaned_by_callback = Arc::clone(&cleaned);
+        owner.register_cleanup(move || async move {
+            cleaned_by_callback.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        run_with_teardown(&mut owner, async { Ok::<(), String>(()) }, || async {
+            Ok::<(), String>(())
+        })
+        .await
+        .expect("successful scenario cleanup");
+        assert!(cleaned.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -63,24 +63,28 @@ async fn cleanup(fixture: &Fixture) {
 }
 
 async fn cleanup_result(fixture: &Fixture) -> Result<(), String> {
+    cleanup_result_for(&fixture.pool, &fixture.beneficiary_id).await
+}
+
+async fn cleanup_result_for(pool: &PgPool, beneficiary_id: &str) -> Result<(), String> {
     sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
         .map_err(|error| format!("delete coverage head: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
         .map_err(|error| format!("delete coverage facts: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
         .map_err(|error| format!("delete coverage revisions: {error}"))?;
     sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
         .map_err(|error| format!("delete coverage test user: {error}"))?;
     Ok(())
@@ -567,6 +571,11 @@ async fn scenario_panic_cleans_owned_publication_fixture() {
     let pool = fixture.pool.clone();
     let beneficiary_id = fixture.beneficiary_id.clone();
     let mut owner = RaceTaskOwner::new();
+    let cleanup_pool = fixture.pool.clone();
+    let cleanup_beneficiary = fixture.beneficiary_id.clone();
+    owner.register_cleanup(move || async move {
+        cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
+    });
     let _task = owner.spawn(async move {
         let mut tx = pool.begin().await.expect("begin panic fixture publication");
         publish(
@@ -598,10 +607,13 @@ async fn scenario_panic_cleans_owned_publication_fixture() {
             #[allow(unreachable_code)]
             Ok::<(), String>(())
         },
-        || async { cleanup_result(&fixture).await },
+        || async { Ok::<(), String>(()) },
     )
     .await;
-    assert_eq!(result, Err("scenario: scenario panicked".into()));
+    assert_eq!(
+        result,
+        Err("scenario: scenario panicked: intentional scenario failure".into())
+    );
 
     let remaining_user: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
         .bind(&fixture.beneficiary_id)
