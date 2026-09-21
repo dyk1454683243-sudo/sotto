@@ -2457,7 +2457,8 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
     let holder_ticket = first_ticket.clone();
     let holder_observations = first_observations.clone();
     let holder_release = release.clone();
-    let holder = tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(async move {
         let mut tx = holder_pool
             .begin()
             .await
@@ -2478,9 +2479,7 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
             .await
             .expect("rollback independent held finish");
         result
-    });
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    }));
     let _holder_pid = receive_pid(holder_ready_rx, "receive independent holder pid").await;
 
     let mut second_tx = second.pool.begin().await.expect("begin independent finish");
@@ -2502,8 +2501,13 @@ async fn independent_beneficiaries_progress_while_one_finish_is_uncommitted() {
         .expect("commit independent beneficiary");
     release.notify_one();
 
-    let mut holder = Some(holder);
-    let first_result = join_with_timeout(&mut holder, "independent held finish").await;
+    let first_result = receive_owned(&mut holder, "independent held finish")
+        .await
+        .expect("independent held finish task completed");
+    owner
+        .join_all()
+        .await
+        .expect("join independent finish task");
     assert!(first_result.is_ok());
     assert_eq!(second_receipt.outcome, PublicationOutcome::Applied);
     assert!(matches!(
@@ -2597,7 +2601,8 @@ async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
     let holder_ticket = second_ticket.clone();
     let holder_observation = second_observation.clone();
     let holder_release = release.clone();
-    let holder = tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(async move {
         let mut tx = holder_pool.begin().await.expect("begin visibility holder");
         let pid = transaction_pid(&mut tx).await;
         let result = finish_collection(
@@ -2611,9 +2616,7 @@ async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
         holder_release.notified().await;
         tx.commit().await.expect("commit visibility holder");
         result
-    });
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    }));
     let _holder_pid = receive_pid(ready_rx, "receive visibility holder pid").await;
 
     let visible = load(&fixture.pool, &fixture.beneficiary_id)
@@ -2635,10 +2638,11 @@ async fn uncommitted_finish_keeps_the_previous_snapshot_visible() {
     .expect("read pending visibility attempt");
     assert_eq!(status, "pending");
     release.notify_one();
-    let mut holder = Some(holder);
-    let result = join_with_timeout(&mut holder, "visibility holder")
+    let result = receive_owned(&mut holder, "visibility holder")
         .await
+        .expect("visibility holder task completed")
         .expect("visibility finish applied");
+    owner.join_all().await.expect("join visibility holder task");
     assert_eq!(result.revision, 3);
     let completed: (String, i64) = sqlx::query_as(
         "SELECT status, projection_revision FROM cloud_coverage_collection_attempts \
@@ -2724,7 +2728,8 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
     let holder_ticket = second_ticket.clone();
     let holder_observation = new_observation.clone();
     let holder_release = release.clone();
-    let holder = tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(async move {
         let mut tx = holder_pool.begin().await.expect("begin rollback holder");
         let pid = transaction_pid(&mut tx).await;
         let result = finish_collection(
@@ -2738,9 +2743,7 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
         holder_release.notified().await;
         tx.rollback().await.expect("rollback visibility holder");
         result
-    });
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    }));
     let _holder_pid = receive_pid(ready_rx, "receive rollback holder pid").await;
     let visible = load(&fixture.pool, &fixture.beneficiary_id)
         .await
@@ -2751,8 +2754,10 @@ async fn rolled_back_finish_preserves_the_snapshot_and_retry_is_idempotent() {
         "rollback-old"
     );
     release.notify_one();
-    let mut holder = Some(holder);
-    let result = join_with_timeout(&mut holder, "rollback holder").await;
+    let result = receive_owned(&mut holder, "rollback holder")
+        .await
+        .expect("rollback holder task completed");
+    owner.join_all().await.expect("join rollback holder task");
     assert!(result.is_ok());
     assert_eq!(projection_snapshot(&fixture).await, before_rollback);
     let after_rollback = load(&fixture.pool, &fixture.beneficiary_id)
