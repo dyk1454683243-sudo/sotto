@@ -56,39 +56,51 @@ impl Fixture {
         })
     }
 
-    async fn create_owned(owner: &mut RaceTaskOwner) -> Option<Self> {
+    async fn create_owned(owner: &mut RaceTaskOwner) -> Result<Option<Self>, String> {
         if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
             eprintln!("skipping cloud coverage store test: set SOTTO_RUN_DB_TESTS=1");
-            return None;
+            return Ok(None);
         }
         let database_url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
-        let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
-        assert!(
-            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
-            "refusing coverage store tests against non-local host: {}",
-            options.get_host()
-        );
-        let pool = db::connect(&database_url).await.expect("connect");
-        db::migrate(&pool).await.expect("migrate");
+            .map_err(|_| "DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1".to_string())?;
+        let options = PgConnectOptions::from_str(&database_url)
+            .map_err(|error| format!("parse DATABASE_URL: {error}"))?;
+        if !matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1") {
+            return Err(format!(
+                "refusing coverage store tests against non-local host: {}",
+                options.get_host()
+            ));
+        }
+        let pool = db::connect(&database_url)
+            .await
+            .map_err(|error| format!("connect: {error}"))?;
+        db::migrate(&pool)
+            .await
+            .map_err(|error| format!("migrate: {error}"))?;
         let beneficiary_id = format!("coverage-store-test-{}", Uuid::new_v4());
         let cleanup_pool = pool.clone();
         let cleanup_beneficiary = beneficiary_id.clone();
         owner.register_cleanup(move || async move {
             cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
         });
-        sqlx::query(
+        let insert_result = sqlx::query(
             "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'coverage-test', $2)",
         )
         .bind(&beneficiary_id)
         .bind(&beneficiary_id)
         .execute(&pool)
-        .await
-        .expect("insert coverage test user");
-        Some(Self {
+        .await;
+        if let Err(error) = insert_result {
+            let error = format!("insert coverage test user: {error}");
+            return match owner.cleanup_registered().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; cleanup: {cleanup}")),
+            };
+        }
+        Ok(Some(Self {
             pool,
             beneficiary_id,
-        })
+        }))
     }
 }
 
@@ -586,7 +598,10 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
 #[tokio::test]
 async fn scenario_panic_cleans_owned_publication_fixture() {
     let mut owner = RaceTaskOwner::new();
-    let Some(fixture) = Fixture::create_owned(&mut owner).await else {
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
     let unrelated = Fixture::create()
@@ -663,7 +678,10 @@ async fn scenario_panic_cleans_owned_publication_fixture() {
 #[tokio::test]
 async fn setup_failure_after_insert_cleans_the_registered_fixture() {
     let mut owner = RaceTaskOwner::new();
-    let Some(fixture) = Fixture::create_owned(&mut owner).await else {
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
     let result = run_with_teardown(
@@ -687,7 +705,10 @@ async fn setup_failure_after_insert_cleans_the_registered_fixture() {
 #[tokio::test]
 async fn readiness_timeout_cancels_a_parked_publication_before_cleanup() {
     let mut owner = RaceTaskOwner::new();
-    let Some(fixture) = Fixture::create_owned(&mut owner).await else {
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
     let (ready, ready_rx) = oneshot::channel();

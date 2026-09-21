@@ -79,6 +79,10 @@ impl RaceTaskOwner {
         self.settle_within(budget, false).await
     }
 
+    pub async fn cleanup_registered(&mut self) -> Result<(), String> {
+        self.cleanup_registered_within(RACE_TIMEOUT).await
+    }
+
     async fn cleanup_registered_within(&mut self, budget: Duration) -> Result<(), String> {
         let deadline = Instant::now() + budget;
         let mut failures = Vec::new();
@@ -445,6 +449,23 @@ mod tests {
         })
         .await
         .expect("successful scenario cleanup");
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn setup_cleanup_can_be_drained_before_supervised_teardown() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let mut owner = RaceTaskOwner::new();
+        let cleaned_by_callback = Arc::clone(&cleaned);
+        owner.register_cleanup(move || async move {
+            cleaned_by_callback.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        owner
+            .cleanup_registered()
+            .await
+            .expect("drain setup cleanup");
         assert!(cleaned.load(Ordering::SeqCst));
     }
 
