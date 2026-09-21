@@ -1108,7 +1108,8 @@ async fn publication_after_revision_anchor(
 ) {
     let release = Arc::new(Notify::new());
     let (publisher_ready, publisher_ready_rx) = oneshot::channel();
-    let publisher = tokio::spawn(held_publication(
+    let mut owner = RaceTaskOwner::new();
+    let mut publisher = Some(owner.spawn(held_publication(
         fixture.pool.clone(),
         fixture.beneficiary_id.clone(),
         format!("bootstrap-after-publication-{suffix}"),
@@ -1116,9 +1117,7 @@ async fn publication_after_revision_anchor(
         projection.clone(),
         publisher_ready,
         release.clone(),
-    ));
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&publisher);
+    )));
     let publisher_pid = receive_pid(publisher_ready_rx, "receive bootstrap publisher pid").await;
 
     let source = binding(
@@ -1129,7 +1128,7 @@ async fn publication_after_revision_anchor(
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_source = source.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool
             .begin()
             .await
@@ -1143,8 +1142,7 @@ async fn publication_after_revision_anchor(
             .await
             .expect("rollback anchored bootstrap registration");
         result
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(
         waiter_ready_rx,
         "receive anchored bootstrap registration pid",
@@ -1153,12 +1151,17 @@ async fn publication_after_revision_anchor(
     wait_for_specific_block(&fixture.pool, waiter_pid, publisher_pid).await;
     release.notify_one();
 
-    let mut publisher = Some(publisher);
-    let publication = join_with_timeout(&mut publisher, "bootstrap publisher")
+    let publication = receive_owned(&mut publisher, "bootstrap publisher")
         .await
+        .expect("bootstrap publisher task completed")
         .expect("bootstrap publication applied");
-    let mut waiter = Some(waiter);
-    let registration = join_with_timeout(&mut waiter, "anchored bootstrap registration").await;
+    let registration = receive_owned(&mut waiter, "anchored bootstrap registration")
+        .await
+        .expect("anchored bootstrap registration task completed");
+    owner
+        .join_all()
+        .await
+        .expect("join anchored bootstrap tasks");
     assert!(matches!(
         registration,
         Err(ReconciliationError::Store(StoreError::RevisionConflict {
