@@ -439,6 +439,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_failure_before_readiness_cancels_a_parked_sibling() {
+        let mut owner = RaceTaskOwner::new();
+        let mut failed = Some(owner.spawn(async {
+            panic!("child failed before readiness");
+        }));
+        let _sibling = owner.spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let result = run_with_teardown(
+            &mut owner,
+            async {
+                receive_owned(&mut failed, "readiness child")
+                    .await
+                    .map(|_| ())
+            },
+            || async { Ok::<(), String>(()) },
+        )
+        .await;
+        assert!(matches!(result, Err(error) if error.contains("readiness child task exited")));
+    }
+
+    #[tokio::test]
     async fn join_deadline_retains_a_parked_child_until_abort() {
         let dropped = Arc::new(AtomicBool::new(false));
         let mut owner = RaceTaskOwner::new();
