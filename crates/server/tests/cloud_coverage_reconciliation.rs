@@ -1810,7 +1810,8 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
     let holder_ticket = ticket.clone();
     let holder_observations = observations.clone();
     let holder_release = release.clone();
-    let holder = tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(async move {
         let mut tx = holder_pool
             .begin()
             .await
@@ -1835,14 +1836,12 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
                 Err(error)
             }
         }
-    });
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    }));
     let holder_pid = receive_pid(holder_ready_rx, "receive completion holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool
             .begin()
             .await
@@ -1864,20 +1863,20 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
                 Err(error)
             }
         }
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive registration waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let mut holder = Some(holder);
-    let completion = join_with_timeout(&mut holder, "held completion race")
+    let completion = receive_owned(&mut holder, "held completion race")
         .await
+        .expect("held completion race task completed")
         .expect("completion race applied");
-    let mut waiter = Some(waiter);
-    let registration = join_with_timeout(&mut waiter, "registration race")
+    let registration = receive_owned(&mut waiter, "registration race")
         .await
+        .expect("registration race task completed")
         .expect("registration race applied");
+    owner.join_all().await.expect("join completion race tasks");
     assert_eq!(completion.revision, 2);
     assert_eq!(completion.outcome, PublicationOutcome::Applied);
     assert_eq!(registration.source_set_generation, 2);
@@ -1977,22 +1976,21 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
     let second_attempt_id = attempt_id(&fixture, "superseded-pending-second");
     let release = Arc::new(Notify::new());
     let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let holder = tokio::spawn(held_begin_collection(
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(held_begin_collection(
         fixture.pool.clone(),
         fixture.beneficiary_id.clone(),
         second_attempt_id.clone(),
         holder_ready,
         release.clone(),
-    ));
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    )));
     let holder_pid = receive_pid(holder_ready_rx, "receive pending replacement pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_ticket = first_ticket.clone();
     let waiter_observation = first_observation.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool
             .begin()
             .await
@@ -2012,16 +2010,21 @@ async fn superseded_finish_waits_for_a_pending_replacement() {
             .await
             .expect("rollback superseded pending finish");
         result
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded pending finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let mut holder = Some(holder);
-    let second_ticket = join_with_timeout(&mut holder, "pending replacement").await;
-    let mut waiter = Some(waiter);
-    let first_result = join_with_timeout(&mut waiter, "superseded pending finish").await;
+    let second_ticket = receive_owned(&mut holder, "pending replacement")
+        .await
+        .expect("pending replacement task completed");
+    let first_result = receive_owned(&mut waiter, "superseded pending finish")
+        .await
+        .expect("superseded pending finish task completed");
+    owner
+        .join_all()
+        .await
+        .expect("join pending replacement tasks");
     assert!(matches!(
         first_result,
         Err(ReconciliationError::AttemptSuperseded)
@@ -2232,23 +2235,22 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
     };
     let release = Arc::new(Notify::new());
     let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let holder = tokio::spawn(held_finish_collection(
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(held_finish_collection(
         fixture.pool.clone(),
         second_ticket.clone(),
         "superseded-completing-second-aggregate".into(),
         vec![second_observation.clone()],
         holder_ready,
         release.clone(),
-    ));
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    )));
     let holder_pid = receive_pid(holder_ready_rx, "receive completing replacement pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_ticket = first_ticket.clone();
     let waiter_observation = first_observation.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool
             .begin()
             .await
@@ -2268,18 +2270,22 @@ async fn superseded_finish_waits_for_a_completing_replacement() {
             .await
             .expect("rollback superseded completing finish");
         result
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded completing finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let mut holder = Some(holder);
-    let second_result = join_with_timeout(&mut holder, "completing replacement")
+    let second_result = receive_owned(&mut holder, "completing replacement")
         .await
+        .expect("completing replacement task completed")
         .expect("completing replacement applied");
-    let mut waiter = Some(waiter);
-    let first_result = join_with_timeout(&mut waiter, "superseded completing finish").await;
+    let first_result = receive_owned(&mut waiter, "superseded completing finish")
+        .await
+        .expect("superseded completing finish task completed");
+    owner
+        .join_all()
+        .await
+        .expect("join completing replacement tasks");
     assert!(matches!(
         first_result,
         Err(ReconciliationError::AttemptSuperseded)
