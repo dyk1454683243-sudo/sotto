@@ -1519,39 +1519,39 @@ async fn competing_source_claims_preserve_provider_allocation_ownership() {
 
     let release = Arc::new(Notify::new());
     let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let holder = tokio::spawn(held_registration(
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(held_registration(
         first.pool.clone(),
         "owner-a-registration".into(),
         first_source.clone(),
         holder_ready,
         release.clone(),
-    ));
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    )));
     let holder_pid = receive_pid(holder_ready_rx, "receive allocation holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = second.pool.clone();
     let waiter_source = second_source.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool.begin().await.expect("begin allocation waiter");
         let pid = transaction_pid(&mut tx).await;
         waiter_ready.send(pid).expect("signal allocation waiter");
         let result = register_source(&mut tx, "owner-b-registration", &waiter_source).await;
         tx.rollback().await.expect("rollback allocation waiter");
         result
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive allocation waiter pid").await;
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let mut holder = Some(holder);
-    let first_receipt = join_with_timeout(&mut holder, "allocation holder")
+    let first_receipt = receive_owned(&mut holder, "allocation holder")
         .await
+        .expect("allocation holder task completed")
         .expect("first allocation claim applied");
-    let mut waiter = Some(waiter);
-    let second_result = join_with_timeout(&mut waiter, "allocation waiter").await;
+    let second_result = receive_owned(&mut waiter, "allocation waiter")
+        .await
+        .expect("allocation waiter task completed");
+    owner.join_all().await.expect("join allocation race tasks");
     assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
     assert!(matches!(
         second_result,
@@ -1585,39 +1585,39 @@ async fn competing_source_claims_preserve_global_source_identity() {
 
     let release = Arc::new(Notify::new());
     let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let holder = tokio::spawn(held_registration(
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(held_registration(
         first.pool.clone(),
         "identity-a-registration".into(),
         first_source.clone(),
         holder_ready,
         release.clone(),
-    ));
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    )));
     let holder_pid = receive_pid(holder_ready_rx, "receive identity holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = second.pool.clone();
     let waiter_source = second_source.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool.begin().await.expect("begin identity waiter");
         let pid = transaction_pid(&mut tx).await;
         waiter_ready.send(pid).expect("signal identity waiter");
         let result = register_source(&mut tx, "identity-b-registration", &waiter_source).await;
         tx.rollback().await.expect("rollback identity waiter");
         result
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive identity waiter pid").await;
     wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let mut holder = Some(holder);
-    let first_receipt = join_with_timeout(&mut holder, "identity holder")
+    let first_receipt = receive_owned(&mut holder, "identity holder")
         .await
+        .expect("identity holder task completed")
         .expect("first identity claim applied");
-    let mut waiter = Some(waiter);
-    let second_result = join_with_timeout(&mut waiter, "identity waiter").await;
+    let second_result = receive_owned(&mut waiter, "identity waiter")
+        .await
+        .expect("identity waiter task completed");
+    owner.join_all().await.expect("join identity race tasks");
     assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
     assert!(matches!(
         second_result,
@@ -1664,21 +1664,20 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
 
     let release = Arc::new(Notify::new());
     let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let holder = tokio::spawn(held_registration(
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(held_registration(
         fixture.pool.clone(),
         "registration-race-second-op".into(),
         second_source,
         holder_ready,
         release.clone(),
-    ));
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    )));
     let holder_pid = receive_pid(holder_ready_rx, "receive registration holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_ticket = ticket.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool.begin().await.expect("begin superseded finish");
         let pid = transaction_pid(&mut tx).await;
         waiter_ready.send(pid).expect("signal superseded finish");
@@ -1691,18 +1690,22 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
         .await;
         tx.rollback().await.expect("rollback superseded finish");
         result
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded finish pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let mut holder = Some(holder);
-    let registration = join_with_timeout(&mut holder, "registration holder")
+    let registration = receive_owned(&mut holder, "registration holder")
         .await
+        .expect("registration holder task completed")
         .expect("second registration applied");
-    let mut waiter = Some(waiter);
-    let finish = join_with_timeout(&mut waiter, "superseded finish").await;
+    let finish = receive_owned(&mut waiter, "superseded finish")
+        .await
+        .expect("superseded finish task completed");
+    owner
+        .join_all()
+        .await
+        .expect("join registration race tasks");
     assert_eq!(registration.source_set_generation, 2);
     assert!(matches!(
         finish,
