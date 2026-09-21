@@ -24,6 +24,8 @@ SCENARIOS = (
     ("cloud_coverage_store", "competing_corrections_serialize_on_the_head_and_reject_the_loser"),
     ("cloud_coverage_store", "simultaneous_first_publications_have_one_winner"),
     ("cloud_coverage_store", "scenario_panic_cleans_owned_publication_fixture"),
+    ("cloud_coverage_store", "setup_failure_after_insert_cleans_the_registered_fixture"),
+    ("cloud_coverage_store", "readiness_timeout_cancels_a_parked_publication_before_cleanup"),
 )
 
 

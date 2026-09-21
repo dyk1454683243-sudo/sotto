@@ -8,13 +8,14 @@ use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
 use tokio::sync::{oneshot, Barrier, Notify};
+use tokio::time::Duration;
 use uuid::Uuid;
 
 mod support;
 
 use support::coverage_concurrency::{
-    receive_owned, receive_pid, run_with_teardown, transaction_pid, wait_for_specific_block,
-    RaceTaskOwner, RACE_TIMEOUT,
+    receive_owned, receive_pid, run_with_teardown, run_with_teardown_with_budgets, transaction_pid,
+    wait_for_specific_block, RaceTaskOwner, RACE_TIMEOUT,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -41,6 +42,41 @@ impl Fixture {
         let pool = db::connect(&database_url).await.expect("connect");
         db::migrate(&pool).await.expect("migrate");
         let beneficiary_id = format!("coverage-store-test-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'coverage-test', $2)",
+        )
+        .bind(&beneficiary_id)
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .expect("insert coverage test user");
+        Some(Self {
+            pool,
+            beneficiary_id,
+        })
+    }
+
+    async fn create_owned(owner: &mut RaceTaskOwner) -> Option<Self> {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping cloud coverage store test: set SOTTO_RUN_DB_TESTS=1");
+            return None;
+        }
+        let database_url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1");
+        let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
+        assert!(
+            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+            "refusing coverage store tests against non-local host: {}",
+            options.get_host()
+        );
+        let pool = db::connect(&database_url).await.expect("connect");
+        db::migrate(&pool).await.expect("migrate");
+        let beneficiary_id = format!("coverage-store-test-{}", Uuid::new_v4());
+        let cleanup_pool = pool.clone();
+        let cleanup_beneficiary = beneficiary_id.clone();
+        owner.register_cleanup(move || async move {
+            cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
+        });
         sqlx::query(
             "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'coverage-test', $2)",
         )
@@ -549,7 +585,8 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
 
 #[tokio::test]
 async fn scenario_panic_cleans_owned_publication_fixture() {
-    let Some(fixture) = Fixture::create().await else {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner).await else {
         return;
     };
     let unrelated = Fixture::create()
@@ -570,12 +607,6 @@ async fn scenario_panic_cleans_owned_publication_fixture() {
     let (ready, ready_rx) = oneshot::channel();
     let pool = fixture.pool.clone();
     let beneficiary_id = fixture.beneficiary_id.clone();
-    let mut owner = RaceTaskOwner::new();
-    let cleanup_pool = fixture.pool.clone();
-    let cleanup_beneficiary = fixture.beneficiary_id.clone();
-    owner.register_cleanup(move || async move {
-        cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
-    });
     let _task = owner.spawn(async move {
         let mut tx = pool.begin().await.expect("begin panic fixture publication");
         publish(
@@ -627,6 +658,85 @@ async fn scenario_panic_cleans_owned_publication_fixture() {
     assert_eq!(unrelated_loaded.revision, 1);
 
     cleanup(&unrelated).await;
+}
+
+#[tokio::test]
+async fn setup_failure_after_insert_cleans_the_registered_fixture() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner).await else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async { Err::<(), _>("setup failed after user insert".into()) },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    assert_eq!(
+        result,
+        Err("scenario: setup failed after user insert".into())
+    );
+    let remaining_user: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+        .bind(&fixture.beneficiary_id)
+        .fetch_optional(&fixture.pool)
+        .await
+        .expect("check setup failure cleanup");
+    assert!(remaining_user.is_none());
+}
+
+#[tokio::test]
+async fn readiness_timeout_cancels_a_parked_publication_before_cleanup() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner).await else {
+        return;
+    };
+    let (ready, ready_rx) = oneshot::channel();
+    let pool = fixture.pool.clone();
+    let beneficiary_id = fixture.beneficiary_id.clone();
+    let _task = owner.spawn(async move {
+        let mut tx = pool.begin().await.expect("begin parked publication");
+        publish(
+            &mut tx,
+            &beneficiary_id,
+            None,
+            "readiness-timeout-publication",
+            "readiness-timeout-evidence",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![],
+            },
+        )
+        .await
+        .expect("publish parked publication");
+        ready.send(()).expect("signal parked publication");
+        std::future::pending::<()>().await;
+    });
+
+    let result = run_with_teardown_with_budgets(
+        &mut owner,
+        async {
+            tokio::time::timeout(RACE_TIMEOUT, ready_rx)
+                .await
+                .map_err(|_| "parked publication did not become ready".to_string())
+                .and_then(|result| {
+                    result.map_err(|_| "parked publication exited early".to_string())
+                })?;
+            tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>())
+                .await
+                .map_err(|_| "readiness timed out".to_string())?;
+            Ok(())
+        },
+        || async { Ok::<(), String>(()) },
+        RACE_TIMEOUT,
+        RACE_TIMEOUT,
+    )
+    .await;
+    assert_eq!(result, Err("scenario: readiness timed out".into()));
+    let remaining_user: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+        .bind(&fixture.beneficiary_id)
+        .fetch_optional(&fixture.pool)
+        .await
+        .expect("check readiness timeout cleanup");
+    assert!(remaining_user.is_none());
 }
 
 #[tokio::test]
