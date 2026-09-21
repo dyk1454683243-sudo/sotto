@@ -15,7 +15,7 @@ pub struct OwnedTask<T> {
 }
 
 pub struct RaceTaskOwner {
-    handles: Vec<JoinHandle<()>>,
+    handles: Vec<Option<JoinHandle<()>>>,
 }
 
 impl RaceTaskOwner {
@@ -31,42 +31,62 @@ impl RaceTaskOwner {
         T: Send + 'static,
     {
         let (sender, receiver) = oneshot::channel();
-        self.handles.push(tokio::spawn(async move {
+        self.handles.push(Some(tokio::spawn(async move {
             let output = future.await;
             let _ = sender.send(output);
-        }));
+        })));
         OwnedTask { receiver }
     }
 
     pub async fn abort_and_join(&mut self) -> Result<(), String> {
-        for handle in &self.handles {
+        for handle in self.handles.iter().flatten() {
             handle.abort();
         }
-        let mut failures = Vec::new();
-        for handle in self.handles.drain(..) {
-            match timeout(RACE_TIMEOUT, handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) if error.is_cancelled() => {}
-                Ok(Err(error)) => failures.push(error.to_string()),
-                Err(_) => failures.push("timed out joining aborted owned race task".into()),
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
+        self.settle_within(RACE_TIMEOUT, true).await
     }
 
     pub async fn join_all(&mut self) -> Result<(), String> {
+        let result = self.join_all_within(RACE_TIMEOUT).await;
+        if let Err(error) = result {
+            let cleanup = self.abort_and_join().await;
+            match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; {cleanup}")),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn join_all_within(&mut self, budget: Duration) -> Result<(), String> {
+        self.settle_within(budget, false).await
+    }
+
+    async fn settle_within(
+        &mut self,
+        budget: Duration,
+        cancellation_is_expected: bool,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + budget;
         let mut failures = Vec::new();
-        for handle in self.handles.drain(..) {
-            match timeout(RACE_TIMEOUT, handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => failures.push(error.to_string()),
+        for slot in &mut self.handles {
+            let Some(handle) = slot.as_mut() else {
+                continue;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match timeout(remaining, &mut *handle).await {
+                Ok(Ok(())) => *slot = None,
+                Ok(Err(error)) if cancellation_is_expected && error.is_cancelled() => {
+                    *slot = None;
+                }
+                Ok(Err(error)) => {
+                    *slot = None;
+                    failures.push(error.to_string());
+                }
                 Err(_) => failures.push("timed out joining owned race task".into()),
             }
         }
+        self.handles.retain(Option::is_some);
         if failures.is_empty() {
             Ok(())
         } else {
@@ -77,7 +97,7 @@ impl RaceTaskOwner {
 
 impl Drop for RaceTaskOwner {
     fn drop(&mut self) {
-        for handle in &self.handles {
+        for handle in self.handles.iter().flatten() {
             handle.abort();
         }
     }
@@ -189,7 +209,32 @@ pub async fn receive_pid(receiver: oneshot::Receiver<i32>, label: &'static str) 
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::task::{Context, Poll};
+    use tokio::time::Duration;
+
     use super::{receive_owned, run_with_teardown, RaceTaskOwner};
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Future for DropMarker {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     #[tokio::test]
     async fn owner_drains_a_panicking_child_and_a_parked_sibling() {
@@ -224,5 +269,20 @@ mod tests {
             result,
             Err("scenario: scenario panicked; cleanup: intentional cleanup failure".into())
         );
+    }
+
+    #[tokio::test]
+    async fn join_deadline_retains_a_parked_child_until_abort() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut owner = RaceTaskOwner::new();
+        let dropped_by_child = Arc::clone(&dropped);
+        let _task = owner.spawn(DropMarker(dropped_by_child));
+
+        let result = owner.join_all_within(Duration::from_millis(10)).await;
+        assert!(result.is_err());
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        owner.abort_and_join().await.expect("abort retained child");
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
