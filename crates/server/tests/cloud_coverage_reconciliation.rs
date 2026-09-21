@@ -18,8 +18,7 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    join_with_timeout, receive_owned, receive_pid, transaction_pid, wait_for_specific_block,
-    RaceTaskGuard, RaceTaskOwner,
+    receive_owned, receive_pid, transaction_pid, wait_for_specific_block, RaceTaskOwner,
 };
 
 struct Fixture {
@@ -2831,7 +2830,8 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
     let holder_ticket = ticket.clone();
     let holder_observations = observations.clone();
     let holder_release = release.clone();
-    let holder = tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(async move {
         let mut tx = holder_pool.begin().await.expect("begin held completion");
         let pid = transaction_pid(&mut tx).await;
         let result = finish_collection(
@@ -2853,16 +2853,14 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
                 Err(error)
             }
         }
-    });
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    }));
     let holder_pid = receive_pid(holder_ready_rx, "receive holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_ticket = ticket.clone();
     let waiter_observations = observations.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool.begin().await.expect("begin waiting completion");
         let pid = transaction_pid(&mut tx).await;
         waiter_ready.send(pid).expect("signal waiting completion");
@@ -2883,20 +2881,23 @@ async fn identical_completion_waits_for_the_winner_and_replays_exactly() {
                 Err(error)
             }
         }
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let mut holder = Some(holder);
-    let applied = join_with_timeout(&mut holder, "held completion")
+    let applied = receive_owned(&mut holder, "held completion")
         .await
+        .expect("held completion task completed")
         .expect("held completion applied");
-    let mut waiter = Some(waiter);
-    let replay = join_with_timeout(&mut waiter, "waiting completion")
+    let replay = receive_owned(&mut waiter, "waiting completion")
         .await
+        .expect("waiting completion task completed")
         .expect("waiting completion replayed");
+    owner
+        .join_all()
+        .await
+        .expect("join identical completion tasks");
     assert_eq!(applied.revision, replay.revision);
     assert_eq!(applied.outcome, PublicationOutcome::Applied);
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
@@ -2995,7 +2996,8 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
     let holder_ticket = ticket.clone();
     let holder_observations = winning_observations.clone();
     let holder_release = release.clone();
-    let holder = tokio::spawn(async move {
+    let mut owner = RaceTaskOwner::new();
+    let mut holder = Some(owner.spawn(async move {
         let mut tx = holder_pool
             .begin()
             .await
@@ -3024,15 +3026,13 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
                 Err(error)
             }
         }
-    });
-    let mut tasks = RaceTaskGuard::new();
-    tasks.watch(&holder);
+    }));
     let holder_pid = receive_pid(holder_ready_rx, "receive winning holder pid").await;
 
     let (waiter_ready, waiter_ready_rx) = oneshot::channel();
     let waiter_pool = fixture.pool.clone();
     let waiter_ticket = ticket.clone();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = Some(owner.spawn(async move {
         let mut tx = waiter_pool.begin().await.expect("begin losing completion");
         let pid = transaction_pid(&mut tx).await;
         waiter_ready.send(pid).expect("signal losing completion");
@@ -3045,18 +3045,22 @@ async fn conflicting_completion_waits_then_rolls_back_without_a_loser_revision()
         .await;
         tx.rollback().await.expect("rollback losing completion");
         result
-    });
-    tasks.watch(&waiter);
+    }));
     let waiter_pid = receive_pid(waiter_ready_rx, "receive losing waiter pid").await;
     wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
     release.notify_one();
 
-    let mut holder = Some(holder);
-    let winner = join_with_timeout(&mut holder, "winning completion")
+    let winner = receive_owned(&mut holder, "winning completion")
         .await
+        .expect("winning completion task completed")
         .expect("winning completion applied");
-    let mut waiter = Some(waiter);
-    let loser = join_with_timeout(&mut waiter, "losing completion").await;
+    let loser = receive_owned(&mut waiter, "losing completion")
+        .await
+        .expect("losing completion task completed");
+    owner
+        .join_all()
+        .await
+        .expect("join conflicting completion tasks");
     assert_eq!(winner.outcome, PublicationOutcome::Applied);
     assert!(matches!(loser, Err(ReconciliationError::OperationConflict)));
     assert_eq!(head_revision(&fixture).await, winner.revision);
