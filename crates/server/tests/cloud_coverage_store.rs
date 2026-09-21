@@ -519,9 +519,9 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
     let Some(fixture) = Fixture::create().await else {
         return;
     };
-    let unrelated = Fixture::create()
-        .await
-        .expect("create unrelated cleanup fixture");
+    let Some(unrelated) = Fixture::create().await else {
+        return;
+    };
     committed_publish(
         &unrelated,
         None,
@@ -597,16 +597,9 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
 
 #[tokio::test]
 async fn scenario_panic_cleans_owned_publication_fixture() {
-    let mut owner = RaceTaskOwner::new();
-    let Some(fixture) = Fixture::create_owned(&mut owner)
-        .await
-        .expect("create owned fixture")
-    else {
+    let Some(unrelated) = Fixture::create().await else {
         return;
     };
-    let unrelated = Fixture::create()
-        .await
-        .expect("create unrelated cleanup fixture");
     committed_publish(
         &unrelated,
         None,
@@ -618,6 +611,14 @@ async fn scenario_panic_cleans_owned_publication_fixture() {
     )
     .await
     .expect("publish unrelated fixture");
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&unrelated).await;
+        return;
+    };
 
     let (ready, ready_rx) = oneshot::channel();
     let pool = fixture.pool.clone();
