@@ -3,7 +3,7 @@ use std::future::Future;
 use futures_util::FutureExt;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::oneshot;
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
 /// The race tests deliberately use a finite budget. A blocked backend must never
@@ -141,34 +141,6 @@ fn format_failure<T>(
     failures.join("; ")
 }
 
-/// Owns cancellation for every task in a race scenario. The guard is installed
-/// before readiness or lock observation starts, so an early panic cancels
-/// siblings instead of detaching them during unwinding. Successful scenarios
-/// still drain their typed handles with `join_with_timeout`.
-pub struct RaceTaskGuard {
-    handles: Vec<AbortHandle>,
-}
-
-impl RaceTaskGuard {
-    pub fn new() -> Self {
-        Self {
-            handles: Vec::new(),
-        }
-    }
-
-    pub fn watch<T>(&mut self, handle: &JoinHandle<T>) {
-        self.handles.push(handle.abort_handle());
-    }
-}
-
-impl Drop for RaceTaskGuard {
-    fn drop(&mut self) {
-        for handle in &self.handles {
-            handle.abort();
-        }
-    }
-}
-
 pub async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
     timeout(
         RACE_TIMEOUT,
@@ -215,81 +187,9 @@ pub async fn receive_pid(receiver: oneshot::Receiver<i32>, label: &'static str) 
         .unwrap_or_else(|_| panic!("{label} task exited before reporting its backend pid"))
 }
 
-/// Wait for a spawned race task without losing ownership when the deadline is
-/// exceeded. The surrounding `RaceTaskGuard` cancels sibling tasks if this
-/// operation or a later assertion unwinds the scenario.
-#[allow(dead_code)]
-pub async fn join_with_timeout<T>(
-    handle: &mut Option<tokio::task::JoinHandle<T>>,
-    label: &'static str,
-) -> T {
-    let task = handle
-        .as_mut()
-        .unwrap_or_else(|| panic!("{label} task was already consumed"));
-    match timeout(RACE_TIMEOUT, task).await {
-        Ok(result) => {
-            let _ = handle.take();
-            result.unwrap_or_else(|error| panic!("{label} task failed: {error}"))
-        }
-        Err(_) => {
-            let task = handle
-                .take()
-                .expect("task handle remains present after timeout");
-            task.abort();
-            match timeout(RACE_TIMEOUT, task).await {
-                Ok(Ok(_)) | Ok(Err(_)) => {}
-                Err(_) => panic!("timed out joining aborted {label} task"),
-            }
-            panic!("timed out waiting for {label} task")
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub async fn abort_and_join<T>(
-    handle: &mut Option<tokio::task::JoinHandle<T>>,
-    label: &'static str,
-) {
-    let Some(handle) = handle.take() else {
-        return;
-    };
-    handle.abort();
-    match timeout(RACE_TIMEOUT, handle).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) if error.is_cancelled() => {}
-        Ok(Err(error)) => panic!("{label} task failed while being aborted: {error}"),
-        Err(_) => panic!("timed out joining aborted {label} task"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        abort_and_join, receive_owned, run_with_teardown, RaceTaskGuard, RaceTaskOwner,
-        RACE_TIMEOUT,
-    };
-
-    #[tokio::test]
-    async fn abort_and_join_drains_an_owned_task() {
-        let mut task = Some(tokio::spawn(async {
-            std::future::pending::<()>().await;
-        }));
-        abort_and_join(&mut task, "pending test task").await;
-        assert!(task.is_none());
-    }
-
-    #[tokio::test]
-    async fn task_guard_aborts_siblings_on_unwind() {
-        let mut task = tokio::spawn(async {
-            std::future::pending::<()>().await;
-        });
-        {
-            let mut guard = RaceTaskGuard::new();
-            guard.watch(&task);
-        }
-        let result = tokio::time::timeout(RACE_TIMEOUT, &mut task).await;
-        assert!(matches!(result, Ok(Err(error)) if error.is_cancelled()));
-    }
+    use super::{receive_owned, run_with_teardown, RaceTaskOwner};
 
     #[tokio::test]
     async fn owner_drains_a_panicking_child_and_a_parked_sibling() {
