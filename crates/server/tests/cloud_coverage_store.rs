@@ -551,65 +551,75 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
     .await
     .expect("publish unrelated fixture");
 
-    let (ready, ready_rx) = oneshot::channel();
-    let pool = fixture.pool.clone();
-    let beneficiary_id = fixture.beneficiary_id.clone();
     let mut owner = RaceTaskOwner::new();
-    let _task = owner.spawn(async move {
-        let mut tx = pool.begin().await.expect("begin owned publication");
-        publish(
-            &mut tx,
-            &beneficiary_id,
-            None,
-            "aborted-publication",
-            "aborted-evidence",
-            &CoverageProjection::Complete {
-                paid_intervals: vec![],
-            },
-        )
-        .await
-        .expect("publish owned publication");
-        ready.send(()).expect("signal owned publication");
-        std::future::pending::<()>().await;
+    let cleanup_pool = fixture.pool.clone();
+    let cleanup_beneficiary = fixture.beneficiary_id.clone();
+    let unrelated_pool = unrelated.pool.clone();
+    let unrelated_beneficiary = unrelated.beneficiary_id.clone();
+    owner.register_cleanup(move || async move {
+        cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await?;
+        cleanup_result_for(&unrelated_pool, &unrelated_beneficiary).await
     });
-    tokio::time::timeout(support::coverage_concurrency::RACE_TIMEOUT, ready_rx)
-        .await
-        .expect("owned publication became ready")
-        .expect("owned publication task exited before readiness");
-    owner
-        .abort_and_join()
-        .await
-        .expect("drain owned publication task");
-
-    let receipt = tokio::time::timeout(
-        support::coverage_concurrency::RACE_TIMEOUT,
-        committed_publish(
-            &fixture,
-            None,
-            "aborted-publication",
-            "aborted-evidence",
-            &CoverageProjection::Complete {
-                paid_intervals: vec![],
-            },
-        ),
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let (ready, ready_rx) = oneshot::channel();
+                let (release, release_rx) = oneshot::channel();
+                let pool = fixture.pool.clone();
+                let beneficiary_id = fixture.beneficiary_id.clone();
+                let _task = owner.spawn(async move {
+                    let mut tx = pool.begin().await.expect("begin owned publication");
+                    publish(
+                        &mut tx,
+                        &beneficiary_id,
+                        None,
+                        "aborted-publication",
+                        "aborted-evidence",
+                        &CoverageProjection::Complete {
+                            paid_intervals: vec![],
+                        },
+                    )
+                    .await
+                    .expect("publish owned publication");
+                    ready.send(()).expect("signal owned publication");
+                    release_rx.await.expect("release owned publication");
+                });
+                tokio::time::timeout(RACE_TIMEOUT, ready_rx)
+                    .await
+                    .expect("owned publication became ready")
+                    .expect("owned publication task exited before readiness");
+                release.send(()).expect("release owned publication");
+                let receipt = committed_publish(
+                    &fixture,
+                    None,
+                    "aborted-publication",
+                    "aborted-evidence",
+                    &CoverageProjection::Complete {
+                        paid_intervals: vec![],
+                    },
+                )
+                .await
+                .expect("replacement publication after task cleanup");
+                assert_eq!(receipt.revision, 1);
+                assert_eq!(
+                    load(&fixture.pool, &fixture.beneficiary_id)
+                        .await
+                        .expect("load replacement publication")
+                        .revision,
+                    receipt.revision
+                );
+                let unrelated_loaded = load(&unrelated.pool, &unrelated.beneficiary_id)
+                    .await
+                    .expect("load unrelated fixture after cleanup");
+                assert_eq!(unrelated_loaded.revision, 1);
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
     )
-    .await
-    .expect("replacement publication was not unblocked by task cleanup")
-    .expect("replacement publication after task cleanup");
-    assert_eq!(receipt.revision, 1);
-    assert_eq!(
-        load(&fixture.pool, &fixture.beneficiary_id)
-            .await
-            .expect("load replacement publication")
-            .revision,
-        receipt.revision
-    );
-    let unrelated_loaded = load(&unrelated.pool, &unrelated.beneficiary_id)
-        .await
-        .expect("load unrelated fixture after cleanup");
-    assert_eq!(unrelated_loaded.revision, 1);
-    cleanup(&fixture).await;
-    cleanup(&unrelated).await;
+    .await;
+    result.expect("supervised publication cleanup");
 }
 
 #[tokio::test]
