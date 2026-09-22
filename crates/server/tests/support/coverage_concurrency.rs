@@ -195,10 +195,24 @@ where
     C: FnOnce() -> CF,
     CF: Future<Output = Result<(), String>>,
 {
+    run_with_context_with_budgets(owner, scenario, cleanup, RACE_TIMEOUT, RACE_TIMEOUT).await
+}
+
+pub async fn run_with_context_with_budgets<T, C, CF>(
+    owner: &mut RaceTaskOwner,
+    scenario: impl for<'a> FnOnce(&'a mut RaceTaskOwner) -> ScenarioFuture<'a, T>,
+    cleanup: C,
+    scenario_budget: Duration,
+    teardown_budget: Duration,
+) -> Result<T, String>
+where
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<(), String>>,
+{
     let scenario_result = {
         let scenario = scenario(owner);
         match timeout(
-            RACE_TIMEOUT,
+            scenario_budget,
             std::panic::AssertUnwindSafe(scenario).catch_unwind(),
         )
         .await
@@ -208,7 +222,14 @@ where
             Err(_) => Err("scenario timed out".into()),
         }
     };
-    run_with_teardown(owner, async move { scenario_result }, cleanup).await
+    run_with_teardown_with_budgets(
+        owner,
+        async move { scenario_result },
+        cleanup,
+        Duration::ZERO,
+        teardown_budget,
+    )
+    .await
 }
 
 pub async fn run_with_teardown_with_budgets<T, F, C, CF>(
