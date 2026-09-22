@@ -39,3 +39,47 @@ fn invalid_share_limits_are_rejected_before_local_setup() {
         );
     }
 }
+
+#[test]
+fn invalid_rollback_versions_are_rejected_before_local_setup() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    for (label, args) in [
+        ("zero", vec!["rollback", "DEMO", "0"]),
+        ("negative", vec!["rollback", "DEMO", "--", "-1"]),
+    ] {
+        let data_dir = scratch.path().join(label);
+        let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+            .current_dir(scratch.path())
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .args(&args)
+            .output()
+            .expect("run sotto");
+
+        assert!(!output.status.success(), "accepted {label}");
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+        assert!(
+            stderr.contains("version") || stderr.to_lowercase().contains("invalid"),
+            "{label}: {stderr}"
+        );
+        assert!(
+            !data_dir.exists(),
+            "{label} created {}",
+            data_dir.display()
+        );
+    }
+
+    // Positive parsing control: version 1 still reaches local-setup (missing project).
+    let data_dir = scratch.path().join("positive");
+    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .current_dir(scratch.path())
+        .env("SOTTO_DATA_DIR", &data_dir)
+        .args(["rollback", "DEMO", "1"])
+        .output()
+        .expect("run sotto");
+    assert!(!output.status.success(), "expected missing-project failure");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(
+        stderr.contains("sotto.toml") || stderr.contains("config"),
+        "positive control: {stderr}"
+    );
+}
