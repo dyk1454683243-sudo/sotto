@@ -14,8 +14,9 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    receive_owned, receive_pid, run_with_teardown, run_with_teardown_with_budgets, transaction_pid,
-    wait_for_specific_block, RaceTaskOwner, RACE_TIMEOUT,
+    receive_owned, receive_pid, run_with_context, run_with_teardown,
+    run_with_teardown_with_budgets, transaction_pid, wait_for_specific_block, RaceTaskOwner,
+    RACE_TIMEOUT,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -402,116 +403,132 @@ async fn competing_corrections_serialize_on_the_head_and_reject_the_loser() {
         )],
     };
     let release = Arc::new(Notify::new());
-    let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let holder_pool = fixture.pool.clone();
-    let holder_beneficiary = fixture.beneficiary_id.clone();
-    let holder_projection = winning_projection.clone();
-    let holder_release = release.clone();
     let mut owner = RaceTaskOwner::new();
-    let mut holder = Some(owner.spawn(async move {
-        let mut tx = holder_pool.begin().await.expect("begin held correction");
-        let pid = transaction_pid(&mut tx).await;
-        let result = publish(
-            &mut tx,
-            &holder_beneficiary,
-            Some(1),
-            "correction-winner",
-            "correction-winner-evidence",
-            &holder_projection,
-        )
-        .await;
-        holder_ready.send(pid).expect("signal held correction");
-        holder_release.notified().await;
-        match result {
-            Ok(receipt) => {
-                tx.commit().await.expect("commit held correction");
-                Ok(receipt)
-            }
-            Err(error) => {
-                tx.rollback().await.expect("rollback held correction");
-                Err(error)
-            }
-        }
-    }));
-    let holder_pid = receive_pid(holder_ready_rx, "receive correction holder pid").await;
+    let cleanup_pool = fixture.pool.clone();
+    let cleanup_beneficiary = fixture.beneficiary_id.clone();
+    owner.register_cleanup(move || async move {
+        cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
+    });
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let (holder_ready, holder_ready_rx) = oneshot::channel();
+                let holder_pool = fixture.pool.clone();
+                let holder_beneficiary = fixture.beneficiary_id.clone();
+                let holder_projection = winning_projection.clone();
+                let holder_release = release.clone();
+                let mut holder = Some(owner.spawn(async move {
+                    let mut tx = holder_pool.begin().await.expect("begin held correction");
+                    let pid = transaction_pid(&mut tx).await;
+                    let result = publish(
+                        &mut tx,
+                        &holder_beneficiary,
+                        Some(1),
+                        "correction-winner",
+                        "correction-winner-evidence",
+                        &holder_projection,
+                    )
+                    .await;
+                    holder_ready.send(pid).expect("signal held correction");
+                    holder_release.notified().await;
+                    match result {
+                        Ok(receipt) => {
+                            tx.commit().await.expect("commit held correction");
+                            Ok(receipt)
+                        }
+                        Err(error) => {
+                            tx.rollback().await.expect("rollback held correction");
+                            Err(error)
+                        }
+                    }
+                }));
+                let holder_pid =
+                    receive_pid(holder_ready_rx, "receive correction holder pid").await;
 
-    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
-    let waiter_pool = fixture.pool.clone();
-    let waiter_beneficiary = fixture.beneficiary_id.clone();
-    let mut waiter = Some(owner.spawn(async move {
-        let mut tx = waiter_pool.begin().await.expect("begin waiting correction");
-        let pid = transaction_pid(&mut tx).await;
-        waiter_ready.send(pid).expect("signal waiting correction");
-        let result = publish(
-            &mut tx,
-            &waiter_beneficiary,
-            Some(1),
-            "correction-loser",
-            "correction-loser-evidence",
-            &losing_projection,
-        )
-        .await;
-        tx.rollback().await.expect("rollback waiting correction");
-        result
-    }));
-    let waiter_pid = receive_pid(waiter_ready_rx, "receive correction waiter pid").await;
-    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
-    release.notify_one();
+                let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+                let waiter_pool = fixture.pool.clone();
+                let waiter_beneficiary = fixture.beneficiary_id.clone();
+                let mut waiter = Some(owner.spawn(async move {
+                    let mut tx = waiter_pool.begin().await.expect("begin waiting correction");
+                    let pid = transaction_pid(&mut tx).await;
+                    waiter_ready.send(pid).expect("signal waiting correction");
+                    let result = publish(
+                        &mut tx,
+                        &waiter_beneficiary,
+                        Some(1),
+                        "correction-loser",
+                        "correction-loser-evidence",
+                        &losing_projection,
+                    )
+                    .await;
+                    tx.rollback().await.expect("rollback waiting correction");
+                    result
+                }));
+                let waiter_pid =
+                    receive_pid(waiter_ready_rx, "receive correction waiter pid").await;
+                wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+                release.notify_one();
 
-    let winner = receive_owned(&mut holder, "held correction")
-        .await
-        .expect("held correction task completed")
-        .expect("winning correction applied");
-    let loser = receive_owned(&mut waiter, "waiting correction")
-        .await
-        .expect("waiting correction task completed");
-    owner.join_all().await.expect("join correction tasks");
-    assert_eq!(winner.outcome, PublicationOutcome::Applied);
-    assert_eq!(winner.revision, 2);
-    assert!(matches!(
-        loser,
-        Err(StoreError::RevisionConflict {
-            expected: Some(1),
-            actual: Some(2),
-        })
-    ));
-    let loaded = load(&fixture.pool, &fixture.beneficiary_id)
-        .await
-        .expect("load winning correction");
-    assert_eq!(loaded.revision, 2);
-    assert_eq!(loaded.coverage.paid_intervals.len(), 1);
-    assert_eq!(
-        loaded.coverage.paid_intervals[0].coverage_id,
-        "correction-winner-fact"
-    );
-    let historical: (String, i64) = sqlx::query_as(
-        "SELECT operation_id, fact_count FROM cloud_coverage_revisions \
-         WHERE beneficiary_id = $1 AND revision = 1",
+                let winner = receive_owned(&mut holder, "held correction")
+                    .await
+                    .expect("held correction task completed")
+                    .expect("winning correction applied");
+                let loser = receive_owned(&mut waiter, "waiting correction")
+                    .await
+                    .expect("waiting correction task completed");
+                assert_eq!(winner.outcome, PublicationOutcome::Applied);
+                assert_eq!(winner.revision, 2);
+                assert!(matches!(
+                    loser,
+                    Err(StoreError::RevisionConflict {
+                        expected: Some(1),
+                        actual: Some(2),
+                    })
+                ));
+                let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+                    .await
+                    .expect("load winning correction");
+                assert_eq!(loaded.revision, 2);
+                assert_eq!(loaded.coverage.paid_intervals.len(), 1);
+                assert_eq!(
+                    loaded.coverage.paid_intervals[0].coverage_id,
+                    "correction-winner-fact"
+                );
+                let historical: (String, i64) = sqlx::query_as(
+                    "SELECT operation_id, fact_count FROM cloud_coverage_revisions \
+                     WHERE beneficiary_id = $1 AND revision = 1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read preserved correction history");
+                assert_eq!(historical, ("correction-base".into(), 1));
+                let historical_fact: String = sqlx::query_scalar(
+                    "SELECT coverage_id FROM cloud_coverage_revision_facts \
+                     WHERE beneficiary_id = $1 AND revision = 1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read preserved correction fact");
+                assert_eq!(historical_fact, "correction-base-fact");
+                let loser_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_revisions \
+                     WHERE beneficiary_id = $1 AND operation_id = 'correction-loser'",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count losing correction");
+                assert_eq!(loser_count, 0);
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
     )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("read preserved correction history");
-    assert_eq!(historical, ("correction-base".into(), 1));
-    let historical_fact: String = sqlx::query_scalar(
-        "SELECT coverage_id FROM cloud_coverage_revision_facts \
-         WHERE beneficiary_id = $1 AND revision = 1",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("read preserved correction fact");
-    assert_eq!(historical_fact, "correction-base-fact");
-    let loser_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cloud_coverage_revisions \
-         WHERE beneficiary_id = $1 AND operation_id = 'correction-loser'",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count losing correction");
-    assert_eq!(loser_count, 0);
-    cleanup(&fixture).await;
+    .await;
+    result.expect("supervised correction race");
 }
 
 #[tokio::test]

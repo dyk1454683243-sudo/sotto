@@ -207,12 +207,7 @@ where
             Err(_) => Err("scenario timed out".into()),
         }
     };
-    run_with_teardown(
-        owner,
-        async move { scenario_result },
-        cleanup,
-    )
-    .await
+    run_with_teardown(owner, async move { scenario_result }, cleanup).await
 }
 
 pub async fn run_with_teardown_with_budgets<T, F, C, CF>(
