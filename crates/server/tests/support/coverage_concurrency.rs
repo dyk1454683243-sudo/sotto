@@ -19,6 +19,8 @@ pub struct RaceTaskOwner {
     cleanups: Vec<CleanupCallback>,
 }
 
+pub type ScenarioFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + 'a>>;
+
 type CleanupCallback = Box<dyn FnOnce() -> CleanupFuture + Send>;
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
@@ -183,6 +185,36 @@ where
     run_with_teardown_with_budgets(owner, scenario, cleanup, RACE_TIMEOUT, RACE_TIMEOUT).await
 }
 
+pub async fn run_with_context<T, C, CF>(
+    owner: &mut RaceTaskOwner,
+    scenario: impl for<'a> FnOnce(&'a mut RaceTaskOwner) -> ScenarioFuture<'a, T>,
+    cleanup: C,
+) -> Result<T, String>
+where
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<(), String>>,
+{
+    let scenario_result = {
+        let scenario = scenario(owner);
+        match timeout(
+            RACE_TIMEOUT,
+            std::panic::AssertUnwindSafe(scenario).catch_unwind(),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(panic)) => Err(format!("scenario panicked: {}", panic_message(panic))),
+            Err(_) => Err("scenario timed out".into()),
+        }
+    };
+    run_with_teardown(
+        owner,
+        async move { scenario_result },
+        cleanup,
+    )
+    .await
+}
+
 pub async fn run_with_teardown_with_budgets<T, F, C, CF>(
     owner: &mut RaceTaskOwner,
     scenario: F,
@@ -326,7 +358,10 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::time::Duration;
 
-    use super::{receive_owned, run_with_teardown, run_with_teardown_with_budgets, RaceTaskOwner};
+    use super::{
+        receive_owned, run_with_context, run_with_teardown, run_with_teardown_with_budgets,
+        RaceTaskOwner,
+    };
 
     struct DropMarker(Arc<AtomicBool>);
 
@@ -450,6 +485,24 @@ mod tests {
         .await
         .expect("successful scenario cleanup");
         assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn context_can_spawn_during_the_supervised_scenario() {
+        let mut owner = RaceTaskOwner::new();
+        let result = run_with_context(
+            &mut owner,
+            |owner| {
+                Box::pin(async move {
+                    let task = owner.spawn(async { 7 });
+                    let mut task = Some(task);
+                    receive_owned(&mut task, "context child").await
+                })
+            },
+            || async { Ok::<(), String>(()) },
+        )
+        .await;
+        assert_eq!(result, Ok(7));
     }
 
     #[tokio::test]
