@@ -64,6 +64,7 @@ impl RaceTaskOwner {
         self.settle_within(budget, true).await
     }
 
+    #[allow(dead_code)]
     pub async fn join_all(&mut self) -> Result<(), String> {
         let result = self.join_all_within(RACE_TIMEOUT).await;
         if let Err(error) = result {
