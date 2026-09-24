@@ -19,6 +19,8 @@ pub struct RaceTaskOwner {
     cleanups: Vec<CleanupCallback>,
 }
 
+pub type ScenarioFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+
 type CleanupCallback = Box<dyn FnOnce() -> CleanupFuture + Send>;
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
@@ -60,19 +62,6 @@ impl RaceTaskOwner {
             handle.abort();
         }
         self.settle_within(budget, true).await
-    }
-
-    pub async fn join_all(&mut self) -> Result<(), String> {
-        let result = self.join_all_within(RACE_TIMEOUT).await;
-        if let Err(error) = result {
-            let cleanup = self.abort_and_join().await;
-            match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(format!("{error}; {cleanup}")),
-            }
-        } else {
-            Ok(())
-        }
     }
 
     pub async fn join_all_within(&mut self, budget: Duration) -> Result<(), String> {
@@ -181,6 +170,55 @@ where
     CF: Future<Output = Result<(), String>>,
 {
     run_with_teardown_with_budgets(owner, scenario, cleanup, RACE_TIMEOUT, RACE_TIMEOUT).await
+}
+
+pub async fn run_with_context<T, C, CF>(
+    owner: &mut RaceTaskOwner,
+    scenario: impl for<'a> FnOnce(&'a mut RaceTaskOwner) -> ScenarioFuture<'a, T>,
+    cleanup: C,
+) -> Result<T, String>
+where
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<(), String>>,
+{
+    run_with_context_with_budgets(owner, scenario, cleanup, RACE_TIMEOUT, RACE_TIMEOUT).await
+}
+
+pub async fn run_with_context_with_budgets<T, C, CF>(
+    owner: &mut RaceTaskOwner,
+    scenario: impl for<'a> FnOnce(&'a mut RaceTaskOwner) -> ScenarioFuture<'a, T>,
+    cleanup: C,
+    scenario_budget: Duration,
+    teardown_budget: Duration,
+) -> Result<T, String>
+where
+    C: FnOnce() -> CF,
+    CF: Future<Output = Result<(), String>>,
+{
+    let scenario_result =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scenario(owner))) {
+            Ok(scenario) => match timeout(
+                scenario_budget,
+                std::panic::AssertUnwindSafe(scenario).catch_unwind(),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(panic)) => Err(format!("scenario panicked: {}", panic_message(panic))),
+                Err(_) => Err("scenario timed out".into()),
+            },
+            Err(panic) => Err(format!("scenario panicked: {}", panic_message(panic))),
+        };
+    // The completed scenario result is already available, so zero lets Tokio poll it
+    // immediately before teardown begins while preserving the shared teardown path.
+    run_with_teardown_with_budgets(
+        owner,
+        async move { scenario_result },
+        cleanup,
+        Duration::ZERO,
+        teardown_budget,
+    )
+    .await
 }
 
 pub async fn run_with_teardown_with_budgets<T, F, C, CF>(
@@ -326,7 +364,10 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::time::Duration;
 
-    use super::{receive_owned, run_with_teardown, run_with_teardown_with_budgets, RaceTaskOwner};
+    use super::{
+        receive_owned, run_with_context, run_with_teardown, run_with_teardown_with_budgets,
+        RaceTaskOwner,
+    };
 
     struct DropMarker(Arc<AtomicBool>);
 
@@ -449,6 +490,53 @@ mod tests {
         })
         .await
         .expect("successful scenario cleanup");
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn context_can_spawn_during_the_supervised_scenario() {
+        let mut owner = RaceTaskOwner::new();
+        let result = run_with_context(
+            &mut owner,
+            |owner| {
+                Box::pin(async move {
+                    let task = owner.spawn(async { 7 });
+                    let mut task = Some(task);
+                    receive_owned(&mut task, "context child").await
+                })
+            },
+            || async { Ok::<(), String>(()) },
+        )
+        .await;
+        assert_eq!(result, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn context_panic_aborts_children_and_runs_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let mut owner = RaceTaskOwner::new();
+        let cleaned_by_callback = Arc::clone(&cleaned);
+        owner.register_cleanup(move || async move {
+            cleaned_by_callback.store(true, Ordering::SeqCst);
+            Err("context cleanup failure".into())
+        });
+        let result = run_with_context(
+            &mut owner,
+            |owner| {
+                Box::pin(async move {
+                    let _task = owner.spawn(async { std::future::pending::<()>().await });
+                    panic!("context scenario failure");
+                    #[allow(unreachable_code)]
+                    Ok::<(), String>(())
+                })
+            },
+            || async { Ok::<(), String>(()) },
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err("scenario: scenario panicked: context scenario failure; cleanup: context cleanup failure".into())
+        );
         assert!(cleaned.load(Ordering::SeqCst));
     }
 
